@@ -7,16 +7,44 @@ using System.Threading.Tasks;
 using System.Reflection;
 namespace Serialization
 {
-    public class BinarySerializer
+    internal struct PropertyDeserializer
     {
+        public byte DataLength { get; set; }
+        public Func<byte[], object> Convert { get; set; }
+    }
+
+
+    public class BinarySerializer
+    {        
+        private Dictionary<Type, PropertyDeserializer> deserializers = new Dictionary<Type, PropertyDeserializer>            
+        {
+            {typeof(int), new PropertyDeserializer(){ DataLength = 4, Convert = bytes => BitConverter.ToInt32(bytes,0)}},
+            {typeof(ulong), new PropertyDeserializer(){ DataLength = 8, Convert = bytes => BitConverter.ToUInt64(bytes,0)}},
+            {typeof(byte), new PropertyDeserializer(){ DataLength = 1, Convert = bytes => bytes[0]}},
+            {typeof(UInt32), new PropertyDeserializer(){ DataLength = 4, Convert = bytes => BitConverter.ToUInt32(bytes, 0)}},
+            {typeof(UInt16), new PropertyDeserializer(){ DataLength = 2, Convert = bytes => BitConverter.ToUInt16(bytes, 0)}}
+        };
+
+        protected IEnumerable<PropertyInfo> GetOrderedProperties(Type type)
+        {
+            return type.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .Select(x => new
+                {
+                    MemberInfo = x,
+                    SerializeAttributes = x.GetCustomAttributes(typeof(SerializeFieldAttribute), true)
+                })
+                .Where(x => x.SerializeAttributes.Any())
+                .OrderBy(x => ((SerializeFieldAttribute)x.SerializeAttributes.First()).Order)
+                .Select(x => x.MemberInfo);
+        }
+
         protected IEnumerable<byte> SerializeProperty(PropertyInfo propertyInfo, object instance)
         {
             byte[] bytes = null;
             if (propertyInfo.PropertyType == typeof(byte))
-                bytes = new byte[1] { (byte)propertyInfo.GetValue(instance, null) };
+                bytes = new[] { (byte)propertyInfo.GetValue(instance, null) };
             else
-            {
-                // for each public property, find the GetBytes method
+            {                
                 // TODO: cache "GetBytes" methods (static filed) Dict<Type-to-be-serialized, Method>
                 var type = propertyInfo.PropertyType;
                 object value = propertyInfo.GetValue(instance, null);
@@ -39,24 +67,34 @@ namespace Serialization
         {
             if (instance == null)
                 yield break;
-            var properties = instance.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .Select(x => new
-                {
-                    MemberInfo = x,
-                    SerializeAttributes = x.GetCustomAttributes(typeof(SerializeFieldAttribute), true)
-                })
-                .Where(x => x.SerializeAttributes.Any())
-                .OrderBy(x => ((SerializeFieldAttribute)x.SerializeAttributes.First()).Order)
-                .Select(x => x.MemberInfo);
-            
-            foreach (var property in properties)
+            var properties = GetOrderedProperties(instance.GetType());            
+            foreach (var b in properties.SelectMany(property => SerializeProperty(property, instance)))
             {
-                //TODO: is that faster than appending?
-                foreach (var b in SerializeProperty(property, instance))
-                {
-                    yield return b;
-                }
+                yield return b;
             }
+        }
+
+        public T Deserialize<T>(Stream s) where T : class
+        {
+            return Deserialize(s, typeof (T)) as T;
+        }
+
+        public object Deserialize(Stream s, Type type)
+        {
+            var instance = Activator.CreateInstance(type);
+            using (var reader = new StreamReader(s))
+                foreach (var property in GetOrderedProperties(type))
+                {
+                    if (!deserializers.ContainsKey(property.PropertyType))
+                        throw new Exception(String.Format("No deserializer for {0} {1}", property.PropertyType.Name,
+                            property.Name));
+                    var deserializer = deserializers[property.PropertyType];
+                    var b = new byte[deserializer.DataLength];
+                    s.Read(b, 0, b.Length);
+                    var value = deserializer.Convert(b);
+                    property.SetValue(instance, value, null);
+                }
+            return instance;
         }
     }
 }
